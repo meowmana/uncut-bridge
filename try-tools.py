@@ -8,12 +8,22 @@ DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def api_key():
     if os.environ.get("OAI_BRIDGE_KEY"):
         return os.environ["OAI_BRIDGE_KEY"]
+    path = os.environ.get("AISTUDIO_CONFIG_FILE") or os.path.expanduser("~/aistudio-api/config.yaml")
     try:
-        cfg = open(os.path.expanduser("~/aistudio-api/config.yaml"), encoding="utf-8").read()
+        cfg = open(path, encoding="utf-8").read()
     except OSError:
         return ""
-    m = re.search(r"^api_keys:[ \t]*(\[.*?\]|(?:\n[ \t]*-[^\n]*)+)", cfg, re.M | re.S)
-    keys = re.findall(r"[^\s\[\],'\"-][^\s\[\],'\"]*", m.group(1)) if m else []
+    try:
+        import yaml
+        keys = (yaml.safe_load(cfg) or {}).get("api_keys") or []
+    except Exception:
+        # no PyYAML: entries are either "- name: ..\n  key: sk-.." or a bare "- sk-.."
+        block = re.split(r"^\S", cfg.split("api_keys:", 1)[-1], maxsplit=1, flags=re.M)[0]
+        keys = re.findall(r"\bkey:\s*['\"]?([^\s'\"]+)", block) or re.findall(r"^\s*-\s*['\"]?([^\s'\":]+)['\"]?\s*$", block, re.M)
+    if isinstance(keys, str):
+        keys = re.split(r"[,\n]", keys)
+    keys = [(k.get("key") if isinstance(k, dict) else k) for k in keys]
+    keys = [str(k).strip() for k in keys if k and str(k).strip()]
     return keys[0] if keys else ""
 
 
@@ -72,6 +82,8 @@ def report(n, what, ok, detail):
     print(f"{n} {what}：{'通过' if ok else '没过'}  {detail}")
 
 
+if call("/models")[0] == 401:
+    sys.exit("钥匙不对：没能从 ~/aistudio-api/config.yaml 读到反代的钥匙。在命令最前面加 OAI_BRIDGE_KEY=你的钥匙 再跑一次")
 model = pick_model()
 print(f"模型：{model}（想换别的：在命令最后加上模型名）")
 
