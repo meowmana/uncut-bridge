@@ -60,10 +60,11 @@ env = dict(os.environ, OAI_BRIDGE_UPSTREAM=f"http://127.0.0.1:{up.server_port}",
            http_proxy="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9", no_proxy="", NO_PROXY="")
 br = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "oai-bridge.py")],
                       env=env, stdout=subprocess.DEVNULL)
+quiet = subprocess.Popen(br.args, env=dict(env, OAI_BRIDGE_PORT="18766", OAI_BRIDGE_KEEPALIVE="0"), stdout=subprocess.DEVNULL)
 B = "http://127.0.0.1:18765/v1"
 
-def req(path, body=None, key="k1"):
-    r = urllib.request.Request(B + path, data=json.dumps(body).encode() if body else None,
+def req(path, body=None, key="k1", base=None):
+    r = urllib.request.Request((base or B) + path, data=json.dumps(body).encode() if body else None,
                                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(r) as x:
@@ -72,11 +73,12 @@ def req(path, body=None, key="k1"):
         return e.code, e.read().decode()
 
 try:
-    for _ in range(50):
-        try:
-            urllib.request.urlopen("http://127.0.0.1:18765/health"); break
-        except OSError:
-            time.sleep(0.1)
+    for port in (18765, 18766):
+        for _ in range(50):
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/health"); break
+            except OSError:
+                time.sleep(0.1)
     code, out = req("/models")
     assert code == 200 and [m["id"] for m in json.loads(out)["data"]] == ["gemini-x", "gemini-x[防截断]"], out
     assert req("/models", key="nope")[0] == 401
@@ -169,6 +171,11 @@ try:
     code, out = req("/chat/completions", {"model": "slow-503", "messages": msgs[:2], "stream": True})
     assert code == 200 and '"error": {"message": "busy", "type": "upstream_error", "code": 503}' in out, (code, out)
     assert out.rstrip().endswith("data: [DONE]"), out
+    # OAI_BRIDGE_KEEPALIVE=0: nothing is sent until Gemini speaks, so a late error still gets its status
+    Q = "http://127.0.0.1:18766/v1"
+    code, out = req("/chat/completions", {"model": "slow-body", "messages": msgs[:2], "stream": True}, base=Q)
+    assert code == 200 and beat not in out and '"content": "late"' in out and out.rstrip().endswith("data: [DONE]"), out
+    assert req("/chat/completions", {"model": "slow-503", "messages": msgs[:2], "stream": True}, base=Q)[0] == 503
     r = urllib.request.Request(B + "/models", method="OPTIONS",
                                headers={"Origin": "http://127.0.0.1:8000", "Access-Control-Request-Method": "GET",
                                         "Access-Control-Request-Headers": "authorization,content-type"})
@@ -177,3 +184,4 @@ try:
     print("all ok")
 finally:
     br.terminate()
+    quiet.terminate()

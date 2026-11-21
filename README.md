@@ -121,6 +121,17 @@ pkill -f oai-bridge.py; sed -i '/oai-bridge/d' ~/.bashrc; rm -f ~/oai-bridge.py 
 | `OAI_BRIDGE_UPSTREAM` | `http://127.0.0.1:8080` |
 | `OAI_BRIDGE_PORT` | `8765` |
 | `OAI_BRIDGE_HOST` | `127.0.0.1` |
+| `OAI_BRIDGE_KEEPALIVE` | `1`。设成 `0` 就不在等的时候递空块 |
+
+不想要等的时候递空块（酒馆计时会回到僵着不动的老样子）：
+
+Termux，装好以后菜单按 0 退到 `~ $` 粘这一行，以后每次自启也都是关着的：
+
+```sh
+sed -i '1i export OAI_BRIDGE_KEEPALIVE=0' ~/.bashrc; export OAI_BRIDGE_KEEPALIVE=0; pkill -f oai-bridge.py; sleep 1; nohup ~/aistudio-api/.venv/bin/python ~/oai-bridge.py >~/oai-bridge.log 2>&1 &
+```
+
+Linux / macOS 启动时写成 `OAI_BRIDGE_KEEPALIVE=0 python3 oai-bridge.py`；Windows PowerShell 先 `$env:OAI_BRIDGE_KEEPALIVE="0"` 再 `python oai-bridge.py`。
 
 ## 自检
 

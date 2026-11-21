@@ -6,6 +6,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 UPSTREAM = os.environ.get("OAI_BRIDGE_UPSTREAM", "http://127.0.0.1:8080").rstrip("/")
 HOST = os.environ.get("OAI_BRIDGE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OAI_BRIDGE_PORT", "8765"))
+KEEPALIVE = os.environ.get("OAI_BRIDGE_KEEPALIVE", "1") != "0"
 SAFETY = [{"category": c, "threshold": "BLOCK_NONE"} for c in (
     "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
     "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")]
@@ -363,7 +364,8 @@ class H(BaseHTTPRequestHandler):
                         except OSError:
                             return
 
-        threading.Thread(target=tick, daemon=True).start()
+        if KEEPALIVE:
+            threading.Thread(target=tick, daemon=True).start()
         try:
             try:
                 resp = DIRECT.open(r, timeout=600)
