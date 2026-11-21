@@ -55,6 +55,20 @@ python oai-bridge.py       # Windows
 
 看到 `oai-bridge on http://127.0.0.1:8765/v1` 就是起来了，窗口别关。aistudio-api 不在本机 8080 的话，先设 `OAI_BRIDGE_UPSTREAM` 指过去（Windows PowerShell 里是 `$env:OAI_BRIDGE_UPSTREAM="http://..."`）。
 
+## 卸载
+
+Termux：菜单按 0 退到 `~ $`，粘这一行，停掉、删掉自启、删掉文件：
+
+```sh
+pkill -f oai-bridge.py; sed -i '/oai-bridge/d' ~/.bashrc; rm -f ~/oai-bridge.py ~/oai-bridge.log
+```
+
+没反应是正常的，冒出新的 `~ $` 就是删完了。
+
+电脑上：在跑它的窗口按 Ctrl+C 关掉，再把 `oai-bridge.py`（下了 `check.py` 的话也一起）删掉。电脑上没有自启，也没装别的东西。
+
+最后把酒馆和插件里填的 `http://127.0.0.1:8765/v1` 改回原来的地址，不然会连不上。
+
 ## 插件里怎么填
 
 - 接口地址：`http://127.0.0.1:8765/v1`
