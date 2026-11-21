@@ -20,6 +20,8 @@ REPLY_TOOL = {"name": "reply", "description": "Deliver the complete reply to the
               "parameters": {"type": "object", "required": ["text"],
                              "properties": {"text": {"type": "string", "description": "The full reply, nothing omitted."}}}}
 REPLY_RULE = "Deliver your entire reply by calling reply(text=...). Put the complete reply in text; write nothing outside the call."
+REPLY_RULE_TOOLS = ("Whenever you write to the user, deliver that entire text by calling reply(text=...) and write nothing "
+                    "outside the call. The other tools stay available; call them as usual whenever they are needed.")
 
 
 def to_parts(content):
@@ -41,7 +43,9 @@ def to_parts(content):
 
 SCHEMA_KEYS = {"type", "format", "description", "nullable", "enum", "properties", "required", "items",
                "minItems", "maxItems", "minimum", "maximum", "minLength", "maxLength", "pattern", "anyOf", "title"}
-# Gemini 3+ wants the signature it issued back on replayed function calls; we don't keep it, so use the documented bypass
+# Gemini 3+ wants the signature (and call id) it issued back when a function call is replayed. OpenAI clients only
+# echo our tool_call id, so keep both here by that id; calls we never saw get the documented bypass instead.
+ISSUED = {}
 SKIP_SIGNATURE = "skip_thought_signature_validator"
 
 
@@ -71,7 +75,8 @@ def to_tools(body):
         if not f or not f.get("name"):
             continue
         d = {"name": f["name"], "description": f.get("description", "")}
-        if f.get("parameters"):
+        # Gemini rejects an OBJECT schema without properties; a tool that takes nothing just omits parameters
+        if (f.get("parameters") or {}).get("properties"):
             d["parameters"] = clean_schema(f["parameters"])
         decls.append(d)
     if not decls:
@@ -101,11 +106,19 @@ def to_gemini(body):
     for m in body.get("messages", []):
         role, parts = m.get("role"), to_parts(m.get("content"))
         if role == "assistant":
-            for c in m.get("tool_calls") or []:
+            for i, c in enumerate(m.get("tool_calls") or []):
                 f = c.get("function") or {}
-                names[c.get("id")] = f.get("name", "")
-                parts.append({"functionCall": {"name": f.get("name", ""), "args": parse_args(f.get("arguments"))},
-                              "thoughtSignature": SKIP_SIGNATURE})
+                known = c.get("id") in ISSUED
+                sig, gid = ISSUED.get(c.get("id"), (None, None))
+                names[c.get("id")] = (f.get("name", ""), gid)
+                call = {"name": f.get("name", ""), "args": parse_args(f.get("arguments"))}
+                if gid:
+                    call["id"] = gid
+                part = {"functionCall": call}
+                # only the first call of a step carries a signature
+                if sig or (i == 0 and not known):
+                    part["thoughtSignature"] = sig or SKIP_SIGNATURE
+                parts.append(part)
         elif role in ("tool", "function"):
             raw = m.get("content")
             if isinstance(raw, list):
@@ -114,8 +127,11 @@ def to_gemini(body):
                 result = json.loads(raw) if isinstance(raw, str) else raw
             except ValueError:
                 result = raw
-            parts = [{"functionResponse": {"name": m.get("name") or names.get(m.get("tool_call_id"), ""),
-                                           "response": result if isinstance(result, dict) else {"result": result}}}]
+            name, gid = names.get(m.get("tool_call_id"), ("", None))
+            fr = {"name": m.get("name") or name, "response": result if isinstance(result, dict) else {"result": result}}
+            if gid:
+                fr["id"] = gid
+            parts = [{"functionResponse": fr}]
         if not parts:
             continue
         if role in ("system", "developer"):
@@ -159,11 +175,16 @@ def tool_mode(model):
     return (model.removesuffix(TOOL_SUFFIX), True) if model.endswith(TOOL_SUFFIX) else (model, False)
 
 
-def with_reply_tool(req):
-    req["tools"] = [{"functionDeclarations": [REPLY_TOOL]}]
-    req["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["reply"]}}
-    req.setdefault("systemInstruction", {"parts": []})["parts"].append({"text": REPLY_RULE})
-    return req
+def with_reply_tool(req, choice):
+    """Add reply() for [防截断]. The caller's own tools stay callable beside it. False = request left untouched."""
+    own = [] if choice == "none" else [d for t in req.get("tools", []) for d in t["functionDeclarations"]]
+    if own and (choice not in (None, "auto") or any(d["name"] == "reply" for d in own)):
+        return False  # the caller forces one of its own tools, or already owns the name
+    mode = {"mode": "ANY"} if own else {"mode": "ANY", "allowedFunctionNames": ["reply"]}
+    req["tools"] = [{"functionDeclarations": own + [REPLY_TOOL]}]
+    req["toolConfig"] = {"functionCallingConfig": mode}
+    req.setdefault("systemInstruction", {"parts": []})["parts"].append({"text": REPLY_RULE_TOOLS if own else REPLY_RULE})
+    return True
 
 
 def from_gemini(g, reply_mode=False):
@@ -172,20 +193,28 @@ def from_gemini(g, reply_mode=False):
         reason = (g.get("promptFeedback") or {}).get("blockReason", "")
         return "", "", "content_filter" if reason else "stop", []
     c = cands[0]
-    text, thought, calls = [], [], []
+    text, thought, calls, loose_sig = [], [], [], None
     for p in (c.get("content") or {}).get("parts", []):
         if p.get("thought"):
             thought.append(p.get("text", ""))
         elif isinstance(p.get("functionCall"), dict):
             fc = p["functionCall"]
             args = fc.get("args") or {}
+            sig, loose_sig = p.get("thoughtSignature") or loose_sig, None
             if reply_mode and fc.get("name") == "reply":
                 text.append(args.get("text", "") if isinstance(args, dict) else str(args))
             else:
-                calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                cid = "call_" + uuid.uuid4().hex[:24]
+                if len(ISSUED) > 2000:
+                    ISSUED.clear()
+                ISSUED[cid] = (sig, fc.get("id"))
+                calls.append({"id": cid, "type": "function",
                               "function": {"name": fc.get("name", ""), "arguments": json.dumps(args, ensure_ascii=False)}})
+        elif "text" in p:
+            text.append(p["text"] or "")
         else:
-            text.append(p.get("text", ""))
+            # the signature can travel as a part of its own just ahead of the call it belongs to
+            loose_sig = p.get("thoughtSignature") or loose_sig
     finish = "tool_calls" if calls else FINISH.get(c.get("finishReason", "STOP"), "stop")
     return "".join(text), "".join(thought), finish, calls
 
@@ -267,10 +296,7 @@ class H(BaseHTTPRequestHandler):
             return self.send(400, {"error": {"message": "bad json"}})
         model, tool = tool_mode(str(body.get("model") or "gemini-2.5-flash").removeprefix("models/"))
         payload = to_gemini(body)
-        # the caller's own tools win; [防截断] only applies to plain chat requests
-        reply_mode = tool and "tools" not in payload
-        if reply_mode:
-            payload = with_reply_tool(payload)
+        reply_mode = tool and with_reply_tool(payload, body.get("tool_choice"))
         if body.get("stream"):
             return self.stream(model, payload, reply_mode)
         code, g = self.call("POST", f"/v1beta/models/{model}:generateContent", payload)

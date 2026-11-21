@@ -15,13 +15,20 @@ class Fake(BaseHTTPRequestHandler):
     def do_POST(self):
         seen["path"] = self.path
         seen["req"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        if seen["req"].get("tools") and ":streamGenerateContent" in self.path:
+        names = [d["name"] for t in seen["req"].get("tools", []) for d in t["functionDeclarations"]]
+        called = []
+        if "fill" in names:
+            called += [{"thoughtSignature": "SIG1"}, {"functionCall": {"name": "fill", "args": {"row": "y"}, "id": "g1"}}]
+        if "reply" in names:
+            called += [{"functionCall": {"name": "reply", "args": {"text": "long reply"}}}]
+        if called and ":streamGenerateContent" in self.path:
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
             for c in ({"candidates": [{"content": {"parts": [{"text": "plan", "thought": True}]}}]},
-                      {"candidates": [{"content": {"parts": [{"functionCall": {"name": "reply", "args": {"text": "long reply"}}}]},
-                                       "finishReason": "STOP"}]}):
+                      {"candidates": [{"content": {"parts": called}, "finishReason": "STOP"}]}):
                 self.wfile.write(f"data: {json.dumps(c)}\n\n".encode()); self.wfile.flush()
             return
+        if called:
+            return self._s(200, {"candidates": [{"content": {"parts": called}, "finishReason": "STOP"}]})
         if ":streamGenerateContent" in self.path:
             assert "alt=sse" in self.path
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
@@ -88,20 +95,48 @@ try:
     assert '"reasoning_content": "plan"' in out and '"content": "long reply"' in out, out
     assert '"finish_reason": "stop"' in out and out.rstrip().endswith("data: [DONE]"), out
     tools = [{"type": "function", "function": {"name": "fill", "description": "d", "parameters": {
-        "type": "object", "additionalProperties": False, "properties": {"row": {"type": ["string", "null"]}}}}}]
-    tmsgs = msgs[:2] + [{"role": "assistant", "content": None, "tool_calls": [
-        {"id": "c1", "type": "function", "function": {"name": "fill", "arguments": "{\"row\": \"x\"}"}}]},
-        {"role": "tool", "tool_call_id": "c1", "content": "{\"ok\": true}"}]
-    code, out = req("/chat/completions", {"model": "gemini-x[防截断]", "messages": tmsgs, "tools": tools, "stream": True})
+        "type": "object", "additionalProperties": False, "properties": {"row": {"type": ["string", "null"]}}}}},
+        {"type": "function", "function": {"name": "ping", "parameters": {"type": "object", "properties": {}}}}]
+    rule = lambda g: "reply(text=" in json.dumps(g.get("systemInstruction"))
+    decls = lambda g: g["tools"][0]["functionDeclarations"]
+    # plain model + plugin tools: tools go through untouched, the call comes back as tool_calls
+    code, out = req("/chat/completions", {"model": "gemini-x", "messages": msgs[:2], "tools": tools, "stream": True})
     g = seen["req"]
-    d = g["tools"][0]["functionDeclarations"][0]
-    assert d["name"] == "fill" and "additionalProperties" not in d["parameters"], g["tools"]
-    assert d["parameters"]["properties"]["row"] == {"type": "string", "nullable": True}, d
-    assert g["toolConfig"]["functionCallingConfig"]["mode"] == "AUTO" and "reply(text=" not in json.dumps(g.get("systemInstruction"))
-    parts = [p for c in g["contents"] for p in c["parts"]]
-    assert any(p.get("functionCall", {}).get("args") == {"row": "x"} for p in parts), parts
-    assert any(p.get("functionResponse", {}).get("name") == "fill" for p in parts), parts
-    assert '"tool_calls": [{"id": "call_' in out and '"name": "reply"' in out and '"finish_reason": "tool_calls"' in out, out
+    assert [d["name"] for d in decls(g)] == ["fill", "ping"] and not rule(g), g
+    assert "additionalProperties" not in decls(g)[0]["parameters"] and "parameters" not in decls(g)[1], decls(g)
+    assert decls(g)[0]["parameters"]["properties"]["row"] == {"type": "string", "nullable": True}, decls(g)
+    assert g["toolConfig"]["functionCallingConfig"]["mode"] == "AUTO"
+    assert '"name": "fill"' in out and '"name": "reply"' not in out and '"finish_reason": "tool_calls"' in out, out
+    cid = out.split('"tool_calls": [{"id": "')[1].split('"')[0]
+    # replaying that call hands Gemini its own signature and id back; a call we never issued gets the bypass
+    for tc_id, want_sig, want_id in ((cid, "SIG1", "g1"), ("c1", "skip_thought_signature_validator", None)):
+        tmsgs = msgs[:2] + [{"role": "assistant", "content": None, "tool_calls": [
+            {"id": tc_id, "type": "function", "function": {"name": "fill", "arguments": "{\"row\": \"x\"}"}}]},
+            {"role": "tool", "tool_call_id": tc_id, "content": "{\"ok\": true}"}]
+        o = json.loads(req("/chat/completions", {"model": "gemini-x", "messages": tmsgs, "tools": tools})[1])
+        assert o["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "fill", o
+        assert o["choices"][0]["finish_reason"] == "tool_calls" and o["choices"][0]["message"]["content"] is None, o
+        parts = [p for c in seen["req"]["contents"] for p in c["parts"]]
+        fc = next(p for p in parts if "functionCall" in p)
+        fr = next(p["functionResponse"] for p in parts if "functionResponse" in p)
+        assert fc["functionCall"]["args"] == {"row": "x"} and fc["thoughtSignature"] == want_sig, fc
+        assert fc["functionCall"].get("id") == want_id and fr.get("id") == want_id and fr["name"] == "fill", (fc, fr)
+    # [防截断] + plugin tools: reply() rides along, prose comes back as content and the plugin call as tool_calls
+    code, out = req("/chat/completions", {"model": "gemini-x[防截断]", "messages": msgs[:2], "tools": tools, "stream": True})
+    g = seen["req"]
+    assert [d["name"] for d in decls(g)] == ["fill", "ping", "reply"] and rule(g), g
+    assert "allowedFunctionNames" not in g["toolConfig"]["functionCallingConfig"], g["toolConfig"]
+    assert '"content": "long reply"' in out and '"name": "fill"' in out and '"name": "reply"' not in out, out
+    assert '"finish_reason": "tool_calls"' in out and out.rstrip().endswith("data: [DONE]"), out
+    # a forced plugin tool is left alone; tool_choice none leaves reply() by itself
+    req("/chat/completions", {"model": "gemini-x[防截断]", "messages": msgs[:2], "tools": tools, "tool_choice": "required"})
+    g = seen["req"]
+    assert [d["name"] for d in decls(g)] == ["fill", "ping"] and not rule(g), g
+    assert g["toolConfig"]["functionCallingConfig"]["mode"] == "ANY"
+    o = json.loads(req("/chat/completions", {"model": "gemini-x[防截断]", "messages": msgs[:2], "tools": tools, "tool_choice": "none"})[1])
+    g = seen["req"]
+    assert [d["name"] for d in decls(g)] == ["reply"] and rule(g), g
+    assert o["choices"][0]["message"]["content"] == "long reply" and "tool_calls" not in o["choices"][0]["message"], o
     r = urllib.request.Request(B + "/models", method="OPTIONS",
                                headers={"Origin": "http://127.0.0.1:8000", "Access-Control-Request-Method": "GET",
                                         "Access-Control-Request-Headers": "authorization,content-type"})
