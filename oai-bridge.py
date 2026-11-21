@@ -245,10 +245,10 @@ class H(BaseHTTPRequestHandler):
                         emit({"reasoning_content": thought})
                     if len(text) > 80:
                         # [防截断] hands the whole reply over at once; trickle it so clients render it as typing
-                        step = max(8, len(text) // 600)
+                        step = max(3, len(text) // 1500)
                         for i in range(0, len(text), step):
                             emit({"content": text[i:i + step]})
-                            time.sleep(0.01)
+                            time.sleep(step / 120)
                     elif text:
                         emit({"content": text})
                     if not text and not thought:
