@@ -22,6 +22,14 @@
 
 ## Termux 安装
 
+装过 aistudio-oai-bridge（这个项目的前身）的，先粘这一行把旧的停掉、删掉旧的自启，再往下装：
+
+```sh
+pkill -f oai-bridge.py; sed -i '/oai-bridge/d' ~/.bashrc
+```
+
+没反应是正常的，冒出新的 `~ $` 就好。
+
 先把 aistudio-api 装好跑起来，然后一次粘：
 
 ```sh
