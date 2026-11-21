@@ -18,7 +18,7 @@ def api_key():
         keys = (yaml.safe_load(cfg) or {}).get("api_keys") or []
     except Exception:
         # no PyYAML: entries are either "- name: ..\n  key: sk-.." or a bare "- sk-.."
-        block = re.split(r"^\S", cfg.split("api_keys:", 1)[-1], maxsplit=1, flags=re.M)[0]
+        block = re.split(r"^[^\s#-]", cfg.split("api_keys:", 1)[-1], maxsplit=1, flags=re.M)[0]
         keys = re.findall(r"\bkey:\s*['\"]?([^\s'\"]+)", block) or re.findall(r"^\s*-\s*['\"]?([^\s'\":]+)['\"]?\s*$", block, re.M)
     if isinstance(keys, str):
         keys = re.split(r"[,\n]", keys)
