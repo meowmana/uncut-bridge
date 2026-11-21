@@ -9,6 +9,7 @@
 - 流式请求（`stream: true`）接 aistudio-api 的流式口，边生成边吐
 - 思考过程放在 `reasoning_content` 里递出去，酒馆能显示思考框
 - 模型列表里每个模型多一个 `[防截断]` 版本，选了才生效，不选照常走
+- 支持工具调用：酒馆或插件（比如数据库填表）传来的工具会转给谷歌，谷歌调工具时按 OpenAI 的样子交回，流式也一样。请求里带了工具时 `[防截断]` 自动让开，按插件的工具走
 
 ## 防截断是什么
 
@@ -54,6 +55,38 @@ python oai-bridge.py       # Windows
 ```
 
 看到 `oai-bridge on http://127.0.0.1:8765/v1` 就是起来了，窗口别关。aistudio-api 不在本机 8080 的话，先设 `OAI_BRIDGE_UPSTREAM` 指过去（Windows PowerShell 里是 `$env:OAI_BRIDGE_UPSTREAM="http://..."`）。
+
+## 更新
+
+Termux：菜单按 0 退到 `~ $`，粘这一行，下新版、停旧的、起新的：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/meowmana/uncut-bridge/main/oai-bridge.py -o ~/oai-bridge.new && mv ~/oai-bridge.new ~/oai-bridge.py && pkill -f oai-bridge.py; sleep 1; nohup ~/aistudio-api/.venv/bin/python ~/oai-bridge.py >~/oai-bridge.log 2>&1 &
+```
+
+再粘这行，看到 `"ok": true` 就是新版起来了：
+
+```sh
+curl -s --noproxy '*' 127.0.0.1:8765/health
+```
+
+自启那行不用动。下载要开梯子，没下下来的话旧的会照常跑着，换个网再粘一次就行。
+
+Linux / macOS：在跑它的窗口按 Ctrl+C 关掉，在 `oai-bridge.py` 所在的文件夹里：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/meowmana/uncut-bridge/main/oai-bridge.py -o oai-bridge.py
+python3 oai-bridge.py
+```
+
+Windows：在跑它的窗口按 Ctrl+C 关掉，在 `oai-bridge.py` 所在的文件夹里开 PowerShell：
+
+```powershell
+curl.exe -fsSL https://raw.githubusercontent.com/meowmana/uncut-bridge/main/oai-bridge.py -o oai-bridge.py
+python oai-bridge.py
+```
+
+也可以直接在浏览器重新下 `oai-bridge.py`，把旧文件覆盖掉，再照常启动。
 
 ## 卸载
 
