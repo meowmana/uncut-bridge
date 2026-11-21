@@ -87,6 +87,21 @@ try:
     assert g["generationConfig"]["thinkingConfig"] == {"includeThoughts": True, "thinkingLevel": "HIGH"}
     assert '"reasoning_content": "plan"' in out and '"content": "long reply"' in out, out
     assert '"finish_reason": "stop"' in out and out.rstrip().endswith("data: [DONE]"), out
+    tools = [{"type": "function", "function": {"name": "fill", "description": "d", "parameters": {
+        "type": "object", "additionalProperties": False, "properties": {"row": {"type": ["string", "null"]}}}}}]
+    tmsgs = msgs[:2] + [{"role": "assistant", "content": None, "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "fill", "arguments": "{\"row\": \"x\"}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "{\"ok\": true}"}]
+    code, out = req("/chat/completions", {"model": "gemini-x[防截断]", "messages": tmsgs, "tools": tools, "stream": True})
+    g = seen["req"]
+    d = g["tools"][0]["functionDeclarations"][0]
+    assert d["name"] == "fill" and "additionalProperties" not in d["parameters"], g["tools"]
+    assert d["parameters"]["properties"]["row"] == {"type": "string", "nullable": True}, d
+    assert g["toolConfig"]["functionCallingConfig"]["mode"] == "AUTO" and "reply(text=" not in json.dumps(g.get("systemInstruction"))
+    parts = [p for c in g["contents"] for p in c["parts"]]
+    assert any(p.get("functionCall", {}).get("args") == {"row": "x"} for p in parts), parts
+    assert any(p.get("functionResponse", {}).get("name") == "fill" for p in parts), parts
+    assert '"tool_calls": [{"id": "call_' in out and '"name": "reply"' in out and '"finish_reason": "tool_calls"' in out, out
     r = urllib.request.Request(B + "/models", method="OPTIONS",
                                headers={"Origin": "http://127.0.0.1:8000", "Access-Control-Request-Method": "GET",
                                         "Access-Control-Request-Headers": "authorization,content-type"})

@@ -39,10 +39,83 @@ def to_parts(content):
     return parts
 
 
+SCHEMA_KEYS = {"type", "format", "description", "nullable", "enum", "properties", "required", "items",
+               "minItems", "maxItems", "minimum", "maximum", "minLength", "maxLength", "pattern", "anyOf", "title"}
+# Gemini 3+ wants the signature it issued back on replayed function calls; we don't keep it, so use the documented bypass
+SKIP_SIGNATURE = "skip_thought_signature_validator"
+
+
+def clean_schema(x):
+    if isinstance(x, list):
+        return [clean_schema(i) for i in x]
+    if not isinstance(x, dict):
+        return x
+    out = {}
+    for k, v in x.items():
+        if k == "properties" and isinstance(v, dict):
+            out[k] = {n: clean_schema(sub) for n, sub in v.items()}
+        elif k in SCHEMA_KEYS:
+            out[k] = clean_schema(v)
+    if isinstance(out.get("type"), list):
+        types = [t for t in out["type"] if t != "null"]
+        out["type"] = types[0] if types else "string"
+        if len(types) < len(x["type"]):
+            out["nullable"] = True
+    return out
+
+
+def to_tools(body):
+    decls = []
+    for t in body.get("tools") or []:
+        f = t.get("function") if t.get("type", "function") == "function" else None
+        if not f or not f.get("name"):
+            continue
+        d = {"name": f["name"], "description": f.get("description", "")}
+        if f.get("parameters"):
+            d["parameters"] = clean_schema(f["parameters"])
+        decls.append(d)
+    if not decls:
+        return None, None
+    choice, mode = body.get("tool_choice"), {"mode": "AUTO"}
+    if choice == "none":
+        mode = {"mode": "NONE"}
+    elif choice == "required":
+        mode = {"mode": "ANY"}
+    elif isinstance(choice, dict) and (choice.get("function") or {}).get("name"):
+        mode = {"mode": "ANY", "allowedFunctionNames": [choice["function"]["name"]]}
+    return [{"functionDeclarations": decls}], {"functionCallingConfig": mode}
+
+
+def parse_args(raw):
+    if isinstance(raw, dict):
+        return raw
+    try:
+        v = json.loads(raw or "{}")
+        return v if isinstance(v, dict) else {"value": v}
+    except ValueError:
+        return {"value": raw}
+
+
 def to_gemini(body):
-    system, contents = [], []
+    system, contents, names = [], [], {}
     for m in body.get("messages", []):
         role, parts = m.get("role"), to_parts(m.get("content"))
+        if role == "assistant":
+            for c in m.get("tool_calls") or []:
+                f = c.get("function") or {}
+                names[c.get("id")] = f.get("name", "")
+                parts.append({"functionCall": {"name": f.get("name", ""), "args": parse_args(f.get("arguments"))},
+                              "thoughtSignature": SKIP_SIGNATURE})
+        elif role in ("tool", "function"):
+            raw = m.get("content")
+            if isinstance(raw, list):
+                raw = "".join(p.get("text", "") for p in raw if isinstance(p, dict))
+            try:
+                result = json.loads(raw) if isinstance(raw, str) else raw
+            except ValueError:
+                result = raw
+            parts = [{"functionResponse": {"name": m.get("name") or names.get(m.get("tool_call_id"), ""),
+                                           "response": result if isinstance(result, dict) else {"result": result}}}]
         if not parts:
             continue
         if role in ("system", "developer"):
@@ -76,6 +149,9 @@ def to_gemini(body):
         cfg["thinkingConfig"] = {"includeThoughts": True, "thinkingLevel": effort}
     if cfg:
         req["generationConfig"] = cfg
+    tools, tool_cfg = to_tools(body)
+    if tools:
+        req["tools"], req["toolConfig"] = tools, tool_cfg
     return req
 
 
@@ -90,22 +166,28 @@ def with_reply_tool(req):
     return req
 
 
-def from_gemini(g):
+def from_gemini(g, reply_mode=False):
     cands = g.get("candidates") or []
     if not cands:
         reason = (g.get("promptFeedback") or {}).get("blockReason", "")
-        return "", "", "content_filter" if reason else "stop"
+        return "", "", "content_filter" if reason else "stop", []
     c = cands[0]
-    text, thought = [], []
+    text, thought, calls = [], [], []
     for p in (c.get("content") or {}).get("parts", []):
         if p.get("thought"):
             thought.append(p.get("text", ""))
         elif isinstance(p.get("functionCall"), dict):
-            args = p["functionCall"].get("args") or {}
-            text.append(args.get("text", "") if isinstance(args, dict) else str(args))
+            fc = p["functionCall"]
+            args = fc.get("args") or {}
+            if reply_mode and fc.get("name") == "reply":
+                text.append(args.get("text", "") if isinstance(args, dict) else str(args))
+            else:
+                calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                              "function": {"name": fc.get("name", ""), "arguments": json.dumps(args, ensure_ascii=False)}})
         else:
             text.append(p.get("text", ""))
-    return "".join(text), "".join(thought), FINISH.get(c.get("finishReason", "STOP"), "stop")
+    finish = "tool_calls" if calls else FINISH.get(c.get("finishReason", "STOP"), "stop")
+    return "".join(text), "".join(thought), finish, calls
 
 
 def usage(g):
@@ -184,21 +266,27 @@ class H(BaseHTTPRequestHandler):
         except ValueError:
             return self.send(400, {"error": {"message": "bad json"}})
         model, tool = tool_mode(str(body.get("model") or "gemini-2.5-flash").removeprefix("models/"))
-        payload = with_reply_tool(to_gemini(body)) if tool else to_gemini(body)
+        payload = to_gemini(body)
+        # the caller's own tools win; [防截断] only applies to plain chat requests
+        reply_mode = tool and "tools" not in payload
+        if reply_mode:
+            payload = with_reply_tool(payload)
         if body.get("stream"):
-            return self.stream(model, payload)
+            return self.stream(model, payload, reply_mode)
         code, g = self.call("POST", f"/v1beta/models/{model}:generateContent", payload)
         if code != 200:
             return self.err(code, g)
-        text, thought, finish = from_gemini(g)
-        msg = {"role": "assistant", "content": text}
+        text, thought, finish, calls = from_gemini(g, reply_mode)
+        msg = {"role": "assistant", "content": text or (None if calls else "")}
+        if calls:
+            msg["tool_calls"] = calls
         if thought:
             msg["reasoning_content"] = thought
         self.send(200, {"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion",
                         "created": int(time.time()), "model": model,
                         "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": usage(g)})
 
-    def stream(self, model, payload):
+    def stream(self, model, payload, reply_mode=False):
         r = urllib.request.Request(f"{UPSTREAM}/v1beta/models/{model}:streamGenerateContent?alt=sse",
                                    data=json.dumps(payload).encode(), method="POST",
                                    headers={"Content-Type": "application/json", "x-goog-api-key": self.key()})
@@ -229,7 +317,7 @@ class H(BaseHTTPRequestHandler):
 
         try:
             emit({"role": "assistant", "content": ""})
-            finish = None
+            finish, n_calls = None, 0
             with resp:
                 for line in resp:
                     line = line.strip()
@@ -240,18 +328,21 @@ class H(BaseHTTPRequestHandler):
                         emit({"content": f"[error] {g['error'].get('message', '')}"})
                         finish = "stop"
                         break
-                    text, thought, fin = from_gemini(g)
+                    text, thought, fin, calls = from_gemini(g, reply_mode)
                     if thought:
                         emit({"reasoning_content": thought})
                     if text:
                         emit({"content": text})
-                    if not text and not thought:
+                    for c in calls:
+                        emit({"tool_calls": [dict(c, index=n_calls)]})
+                        n_calls += 1
+                    if not text and not thought and not calls:
                         # a comment keeps idle clients from timing out
                         self.wfile.write(b": thinking\n\n")
                         self.wfile.flush()
                     if (g.get("candidates") or [{}])[0].get("finishReason"):
                         finish = fin
-            emit({}, finish or "stop")
+            emit({}, "tool_calls" if n_calls else (finish or "stop"))
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
