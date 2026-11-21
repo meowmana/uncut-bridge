@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """OpenAI chat/completions -> Gemini generateContent. Python 3 stdlib only."""
-import json, os, time, uuid, urllib.request, urllib.error
+import json, os, threading, time, uuid, urllib.request, urllib.error
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 UPSTREAM = os.environ.get("OAI_BRIDGE_UPSTREAM", "http://127.0.0.1:8080").rstrip("/")
@@ -316,33 +316,65 @@ class H(BaseHTTPRequestHandler):
         r = urllib.request.Request(f"{UPSTREAM}/v1beta/models/{model}:streamGenerateContent?alt=sse",
                                    data=json.dumps(payload).encode(), method="POST",
                                    headers={"Content-Type": "application/json", "x-goog-api-key": self.key()})
-        try:
-            resp = DIRECT.open(r, timeout=600)
-        except urllib.error.HTTPError as e:
-            raw = e.read()
-            try:
-                return self.err(e.code, json.loads(raw))
-            except ValueError:
-                return self.err(e.code, {"error": {"message": raw.decode("utf-8", "replace")}})
-        except (urllib.error.URLError, OSError) as e:
-            return self.err(502, {"error": {"message": f"upstream {UPSTREAM} unreachable: {e}"}})
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.close_connection = True
         base = {"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion.chunk",
                 "created": int(time.time()), "model": model}
+        lock, done, t0, last = threading.Lock(), threading.Event(), time.monotonic(), [0.0]
+
+        def chunk(delta, fin=None):
+            return json.dumps(dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": fin}]), ensure_ascii=False)
+
+        def put(data):
+            if not last[0]:
+                self.send_response(200)
+                for k, v in (("Content-Type", "text/event-stream; charset=utf-8"), ("Cache-Control", "no-cache"),
+                             ("Connection", "close"), ("Access-Control-Allow-Origin", "*")):
+                    self.send_header(k, v)
+                self.end_headers()
+                self.close_connection = True
+                last[0] = time.monotonic()
+                put(chunk({"role": "assistant", "content": ""}))
+            self.wfile.write(f"data: {data}\n\n".encode())
+            self.wfile.flush()
+            last[0] = time.monotonic()
 
         def emit(delta, fin=None):
-            chunk = dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": fin}])
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-            self.wfile.flush()
+            with lock:
+                put(chunk(delta, fin))
 
+        def fail(code, g):
+            with lock:
+                done.set()
+                if not last[0]:
+                    return self.err(code, g)
+                e = g.get("error") if isinstance(g.get("error"), dict) else {"message": json.dumps(g, ensure_ascii=False)}
+                put(json.dumps({"error": {"message": e.get("message", ""), "type": "upstream_error", "code": code}},
+                               ensure_ascii=False))
+                put("[DONE]")
+
+        def tick():
+            # Gemini can stay silent until it is finished (it does under [防截断]); a client's timer only moves on data events
+            while not done.wait(0.5):
+                with lock:
+                    if done.is_set():
+                        return
+                    if time.monotonic() - (last[0] or t0) >= 1:
+                        try:
+                            put(chunk({"content": ""}))
+                        except OSError:
+                            return
+
+        threading.Thread(target=tick, daemon=True).start()
         try:
-            emit({"role": "assistant", "content": ""})
+            try:
+                resp = DIRECT.open(r, timeout=600)
+            except urllib.error.HTTPError as e:
+                raw = e.read()
+                try:
+                    return fail(e.code, json.loads(raw))
+                except ValueError:
+                    return fail(e.code, {"error": {"message": raw.decode("utf-8", "replace")}})
+            except (urllib.error.URLError, OSError) as e:
+                return fail(502, {"error": {"message": f"upstream {UPSTREAM} unreachable: {e}"}})
             finish, n_calls = None, 0
             with resp:
                 for line in resp:
@@ -362,17 +394,16 @@ class H(BaseHTTPRequestHandler):
                     for c in calls:
                         emit({"tool_calls": [dict(c, index=n_calls)]})
                         n_calls += 1
-                    if not text and not thought and not calls:
-                        # a comment keeps idle clients from timing out
-                        self.wfile.write(b": thinking\n\n")
-                        self.wfile.flush()
                     if (g.get("candidates") or [{}])[0].get("finishReason"):
                         finish = fin
-            emit({}, "tool_calls" if n_calls else (finish or "stop"))
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            with lock:
+                done.set()
+                put(chunk({}, "tool_calls" if n_calls else (finish or "stop")))
+                put("[DONE]")
         except (BrokenPipeError, ConnectionResetError):
             pass
+        finally:
+            done.set()
 
     def log_message(self, fmt, *args):
         print(time.strftime("%H:%M:%S"), self.command, self.path, *args[1:2], flush=True)

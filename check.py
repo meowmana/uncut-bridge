@@ -15,6 +15,19 @@ class Fake(BaseHTTPRequestHandler):
     def do_POST(self):
         seen["path"] = self.path
         seen["req"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if "fast-503" in self.path:
+            time.sleep(0.3)
+            return self._s(503, {"error": {"message": "busy"}})
+        if "slow-503" in self.path:
+            time.sleep(1.8)
+            return self._s(503, {"error": {"message": "busy"}})
+        if "slow-head" in self.path:
+            time.sleep(3.2)
+        if "slow-body" in self.path:
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            self.wfile.flush(); time.sleep(3.2)
+            self.wfile.write(b'data: {"candidates": [{"content": {"parts": [{"text": "late"}]}, "finishReason": "STOP"}]}\n\n')
+            return
         names = [d["name"] for t in seen["req"].get("tools", []) for d in t["functionDeclarations"]]
         called = []
         if "fill" in names:
@@ -137,6 +150,25 @@ try:
     g = seen["req"]
     assert [d["name"] for d in decls(g)] == ["reply"] and rule(g), g
     assert o["choices"][0]["message"]["content"] == "long reply" and "tool_calls" not in o["choices"][0]["message"], o
+    # while Gemini is silent an empty delta goes out every second, before and after its headers arrive
+    beat = '"delta": {"content": ""}'
+    for m, want in (("slow-head", '"content": "h"'), ("slow-body", '"content": "late"')):
+        t = time.time()
+        r = urllib.request.Request(B + "/chat/completions", headers={"Authorization": "Bearer k1"},
+                                   data=json.dumps({"model": m, "messages": msgs[:2], "stream": True}).encode())
+        with urllib.request.urlopen(r) as x:
+            x.readline()
+            first = time.time() - t
+            out = x.read().decode()
+        assert first < 2 and out.count(beat) >= 2 and out.index(beat) < out.index(want), (m, first, out)
+        assert out.rstrip().endswith("data: [DONE]"), out
+    assert beat not in req("/chat/completions", {"model": "gemini-x", "messages": msgs, "stream": True})[1]
+    # an upstream error keeps its status when it is quick, and becomes an error event once the stream has started
+    code, out = req("/chat/completions", {"model": "fast-503", "messages": msgs[:2], "stream": True})
+    assert code == 503 and json.loads(out)["error"]["message"] == "busy", (code, out)
+    code, out = req("/chat/completions", {"model": "slow-503", "messages": msgs[:2], "stream": True})
+    assert code == 200 and '"error": {"message": "busy", "type": "upstream_error", "code": 503}' in out, (code, out)
+    assert out.rstrip().endswith("data: [DONE]"), out
     r = urllib.request.Request(B + "/models", method="OPTIONS",
                                headers={"Origin": "http://127.0.0.1:8000", "Access-Control-Request-Method": "GET",
                                         "Access-Control-Request-Headers": "authorization,content-type"})
