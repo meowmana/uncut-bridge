@@ -18,7 +18,7 @@ class Fake(BaseHTTPRequestHandler):
         if seen["req"].get("tools") and ":streamGenerateContent" in self.path:
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
             for c in ({"candidates": [{"content": {"parts": [{"text": "plan", "thought": True}]}}]},
-                      {"candidates": [{"content": {"parts": [{"functionCall": {"name": "reply", "args": {"text": "long reply"}}}]},
+                      {"candidates": [{"content": {"parts": [{"functionCall": {"name": "reply", "args": {"text": "long reply " * 20}}}]},
                                        "finishReason": "STOP"}]}):
                 self.wfile.write(f"data: {json.dumps(c)}\n\n".encode()); self.wfile.flush()
             return
@@ -85,7 +85,10 @@ try:
     assert g["toolConfig"]["functionCallingConfig"]["mode"] == "ANY" and g["tools"][0]["functionDeclarations"][0]["name"] == "reply"
     assert "reply(text=" in g["systemInstruction"]["parts"][-1]["text"]
     assert g["generationConfig"]["thinkingConfig"] == {"includeThoughts": True, "thinkingLevel": "HIGH"}
-    assert '"reasoning_content": "plan"' in out and '"content": "long reply"' in out, out
+    assert '"reasoning_content": "plan"' in out and out.count('"content": "') > 20, out
+    got = "".join(json.loads(l[5:])["choices"][0]["delta"].get("content", "") for l in out.splitlines()
+                  if l.startswith("data: {"))
+    assert got == "long reply " * 20, got
     assert '"finish_reason": "stop"' in out and out.rstrip().endswith("data: [DONE]"), out
     r = urllib.request.Request(B + "/models", method="OPTIONS",
                                headers={"Origin": "http://127.0.0.1:8000", "Access-Control-Request-Method": "GET",
