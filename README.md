@@ -36,7 +36,7 @@ pkill -f oai-bridge.py; sed -i '/oai-bridge/d' ~/.bashrc
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/meowmana/uncut-bridge/main/oai-bridge.py -o ~/oai-bridge.py
-sed -i '1i curl -sf --noproxy "*" -m 2 127.0.0.1:8765/health >/dev/null || (nohup ~/aistudio-api/.venv/bin/python ~/oai-bridge.py >~/oai-bridge.log 2>&1 &)' ~/.bashrc
+{ echo 'curl -sf --noproxy "*" -m 2 127.0.0.1:8765/health >/dev/null || (nohup ~/aistudio-api/.venv/bin/python ~/oai-bridge.py >~/oai-bridge.log 2>&1 &)'; cat ~/.bashrc 2>/dev/null; } > ~/.bashrc.new; mv ~/.bashrc.new ~/.bashrc
 nohup ~/aistudio-api/.venv/bin/python ~/oai-bridge.py >~/oai-bridge.log 2>&1 &
 sleep 1; curl -s --noproxy '*' 127.0.0.1:8765/health
 ```
@@ -45,6 +45,12 @@ sleep 1; curl -s --noproxy '*' 127.0.0.1:8765/health
 - aistudio-api 没装在 `~/aistudio-api` 的，把第二行里的 python 路径改成你自己的
 
 最后一行看到 `"ok": true` 就是起来了。以后每次打开 Termux 它会自己起，日志在 `~/oai-bridge.log`。
+
+重开 Termux 以后模型不见了、上面那行检查什么都不显示的：多半是 11/22 之前装的，那时的安装命令在没有 `~/.bashrc` 的手机上写不进自启。粘这一行补上，再重开一次 Termux：
+
+```sh
+grep -qs oai-bridge ~/.bashrc || echo 'curl -sf --noproxy "*" -m 2 127.0.0.1:8765/health >/dev/null || (nohup ~/aistudio-api/.venv/bin/python ~/oai-bridge.py >~/oai-bridge.log 2>&1 &)' >> ~/.bashrc
+```
 
 ## 电脑上（Linux / macOS / Windows）
 
@@ -128,7 +134,7 @@ pkill -f oai-bridge.py; sed -i '/oai-bridge/d' ~/.bashrc; rm -f ~/oai-bridge.py 
 Termux，装好以后菜单按 0 退到 `~ $` 粘这一行，以后每次自启也都是关着的：
 
 ```sh
-sed -i '1i export OAI_BRIDGE_KEEPALIVE=0' ~/.bashrc; export OAI_BRIDGE_KEEPALIVE=0; pkill -f oai-bridge.py; sleep 1; nohup ~/aistudio-api/.venv/bin/python ~/oai-bridge.py >~/oai-bridge.log 2>&1 &
+{ echo 'export OAI_BRIDGE_KEEPALIVE=0'; cat ~/.bashrc 2>/dev/null; } > ~/.bashrc.new; mv ~/.bashrc.new ~/.bashrc; export OAI_BRIDGE_KEEPALIVE=0; pkill -f oai-bridge.py; sleep 1; nohup ~/aistudio-api/.venv/bin/python ~/oai-bridge.py >~/oai-bridge.log 2>&1 &
 ```
 
 Linux / macOS 启动时写成 `OAI_BRIDGE_KEEPALIVE=0 python3 oai-bridge.py`；Windows PowerShell 先 `$env:OAI_BRIDGE_KEEPALIVE="0"` 再 `python oai-bridge.py`。
