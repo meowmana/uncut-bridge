@@ -222,7 +222,8 @@ def from_gemini(g, reply_mode=False):
 
 
 def timed_out(e):
-    return isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)
+    # socket.timeout, not TimeoutError: they are one class only from Python 3.10 (macOS python3 is 3.9)
+    return isinstance(e, socket.timeout) or isinstance(getattr(e, "reason", None), socket.timeout)
 
 
 def silent():
@@ -404,7 +405,7 @@ class H(BaseHTTPRequestHandler):
                     return fail(*silent())
                 return fail(502, {"error": {"message": f"upstream {UPSTREAM} unreachable: {e}"}})
             if gone.is_set():
-                return abort(resp)
+                return resp.close()
             finish, n_calls = None, 0
             with resp:
                 try:
@@ -427,7 +428,7 @@ class H(BaseHTTPRequestHandler):
                             n_calls += 1
                         if (g.get("candidates") or [{}])[0].get("finishReason"):
                             finish = fin
-                except TimeoutError:
+                except socket.timeout:
                     return fail(*silent())
                 except (OSError, ValueError):
                     if gone.is_set():
