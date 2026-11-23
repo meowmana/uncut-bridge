@@ -1,5 +1,5 @@
 """Self-check: fake Gemini upstream + bridge, asserts the translation. Run: python check.py"""
-import json, os, subprocess, sys, threading, time, urllib.request, urllib.error
+import json, os, socket, subprocess, sys, threading, time, urllib.request, urllib.error
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 seen = {}
@@ -21,6 +21,23 @@ class Fake(BaseHTTPRequestHandler):
         if "slow-503" in self.path:
             time.sleep(1.8)
             return self._s(503, {"error": {"message": "busy"}})
+        if "hang" in self.path:
+            # headers, then silence; notice the bridge hanging up the way an async server would, by reading EOF
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            self.wfile.write(b": ping\n\n"); self.wfile.flush()
+            t, conn = time.time(), self.connection
+            conn.settimeout(0.3)
+            while time.time() - t < 6:
+                try:
+                    if conn.recv(1) == b"":
+                        seen["hung_up"] = time.time() - t
+                        return
+                except TimeoutError:
+                    pass
+            return
+        if "mute" in self.path:
+            time.sleep(3.5)
+            return self._s(200, {"candidates": [{"content": {"parts": [{"text": "too late"}]}, "finishReason": "STOP"}]})
         if "slow-head" in self.path:
             time.sleep(3.2)
         if "slow-body" in self.path:
@@ -60,6 +77,7 @@ env = dict(os.environ, OAI_BRIDGE_UPSTREAM=f"http://127.0.0.1:{up.server_port}",
            http_proxy="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9", no_proxy="", NO_PROXY="")
 br = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "oai-bridge.py")],
                       env=env, stdout=subprocess.DEVNULL)
+short = subprocess.Popen(br.args, env=dict(env, OAI_BRIDGE_PORT="18767", OAI_BRIDGE_TIMEOUT="2"), stdout=subprocess.DEVNULL)
 quiet = subprocess.Popen(br.args, env=dict(env, OAI_BRIDGE_PORT="18766", OAI_BRIDGE_KEEPALIVE="0"), stdout=subprocess.DEVNULL)
 B = "http://127.0.0.1:18765/v1"
 
@@ -73,7 +91,7 @@ def req(path, body=None, key="k1", base=None):
         return e.code, e.read().decode()
 
 try:
-    for port in (18765, 18766):
+    for port in (18765, 18766, 18767):
         for _ in range(50):
             try:
                 urllib.request.urlopen(f"http://127.0.0.1:{port}/health"); break
@@ -176,6 +194,23 @@ try:
     code, out = req("/chat/completions", {"model": "slow-body", "messages": msgs[:2], "stream": True}, base=Q)
     assert code == 200 and beat not in out and '"content": "late"' in out and out.rstrip().endswith("data: [DONE]"), out
     assert req("/chat/completions", {"model": "slow-503", "messages": msgs[:2], "stream": True}, base=Q)[0] == 503
+    # an upstream that goes quiet past OAI_BRIDGE_TIMEOUT says so instead of ending the stream empty
+    S = "http://127.0.0.1:18767/v1"
+    for stream in (True, False):
+        code, out = req("/chat/completions", {"model": "mute", "messages": msgs[:2], "stream": stream}, base=S)
+        assert "sent nothing for 2s" in out, (stream, code, out)
+        assert (code, out.rstrip().endswith("data: [DONE]")) == ((200, True) if stream else (504, False)), (code, out)
+    # the client hangs up mid-wait (stop / regenerate): the upstream call is dropped too, not left running
+    seen.pop("hung_up", None)
+    body = json.dumps({"model": "hang", "messages": msgs[:2], "stream": True}).encode()
+    c = socket.create_connection(("127.0.0.1", 18765))
+    c.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer k1\r\n"
+              b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    c.recv(64); c.close()
+    for _ in range(70):
+        if "hung_up" in seen: break
+        time.sleep(0.1)
+    assert seen.get("hung_up", 99) < 4, seen.get("hung_up")
     r = urllib.request.Request(B + "/models", method="OPTIONS",
                                headers={"Origin": "http://127.0.0.1:8000", "Access-Control-Request-Method": "GET",
                                         "Access-Control-Request-Headers": "authorization,content-type"})
@@ -185,3 +220,4 @@ try:
 finally:
     br.terminate()
     quiet.terminate()
+    short.terminate()

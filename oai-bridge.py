@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """OpenAI chat/completions -> Gemini generateContent. Python 3 stdlib only."""
-import json, os, threading, time, uuid, urllib.request, urllib.error
+import json, os, socket, threading, time, uuid, urllib.request, urllib.error
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 UPSTREAM = os.environ.get("OAI_BRIDGE_UPSTREAM", "http://127.0.0.1:8080").rstrip("/")
 HOST = os.environ.get("OAI_BRIDGE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OAI_BRIDGE_PORT", "8765"))
 KEEPALIVE = os.environ.get("OAI_BRIDGE_KEEPALIVE", "1") != "0"
+TIMEOUT = float(os.environ.get("OAI_BRIDGE_TIMEOUT", "600"))
 SAFETY = [{"category": c, "threshold": "BLOCK_NONE"} for c in (
     "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
     "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")]
@@ -220,6 +221,22 @@ def from_gemini(g, reply_mode=False):
     return "".join(text), "".join(thought), finish, calls
 
 
+def timed_out(e):
+    return isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)
+
+
+def silent():
+    return 504, {"error": {"message": f"upstream {UPSTREAM} sent nothing for {TIMEOUT:g}s"}}
+
+
+def abort(resp):
+    """Hang up on the upstream from another thread; a blocked read only wakes on shutdown, not close."""
+    try:
+        resp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+    except (AttributeError, OSError):
+        pass
+
+
 def usage(g):
     u = g.get("usageMetadata") or {}
     p, c = u.get("promptTokenCount", 0), u.get("candidatesTokenCount", 0)
@@ -238,7 +255,7 @@ class H(BaseHTTPRequestHandler):
         r = urllib.request.Request(UPSTREAM + path, data=data, method=method,
                                    headers={"Content-Type": "application/json", "x-goog-api-key": self.key()})
         try:
-            with DIRECT.open(r, timeout=600) as resp:
+            with DIRECT.open(r, timeout=TIMEOUT) as resp:
                 return resp.status, json.loads(resp.read() or b"{}")
         except urllib.error.HTTPError as e:
             raw = e.read()
@@ -247,6 +264,8 @@ class H(BaseHTTPRequestHandler):
             except ValueError:
                 return e.code, {"error": {"message": raw.decode("utf-8", "replace")}}
         except (urllib.error.URLError, OSError) as e:
+            if timed_out(e):
+                return silent()
             return 502, {"error": {"message": f"upstream {UPSTREAM} unreachable: {e}"}}
 
     def send(self, code, obj):
@@ -320,6 +339,8 @@ class H(BaseHTTPRequestHandler):
         base = {"id": "chatcmpl-" + uuid.uuid4().hex[:24], "object": "chat.completion.chunk",
                 "created": int(time.time()), "model": model}
         lock, done, t0, last = threading.Lock(), threading.Event(), time.monotonic(), [0.0]
+        # the client hung up (stop / regenerate): drop the upstream call too, or it keeps the account busy
+        gone, up = threading.Event(), [None]
 
         def chunk(delta, fin=None):
             return json.dumps(dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": fin}]), ensure_ascii=False)
@@ -362,13 +383,16 @@ class H(BaseHTTPRequestHandler):
                         try:
                             put(chunk({"content": ""}))
                         except OSError:
+                            gone.set()
+                            if up[0]:
+                                abort(up[0])
                             return
 
         if KEEPALIVE:
             threading.Thread(target=tick, daemon=True).start()
         try:
             try:
-                resp = DIRECT.open(r, timeout=600)
+                resp = up[0] = DIRECT.open(r, timeout=TIMEOUT)
             except urllib.error.HTTPError as e:
                 raw = e.read()
                 try:
@@ -376,28 +400,41 @@ class H(BaseHTTPRequestHandler):
                 except ValueError:
                     return fail(e.code, {"error": {"message": raw.decode("utf-8", "replace")}})
             except (urllib.error.URLError, OSError) as e:
+                if timed_out(e):
+                    return fail(*silent())
                 return fail(502, {"error": {"message": f"upstream {UPSTREAM} unreachable: {e}"}})
+            if gone.is_set():
+                return abort(resp)
             finish, n_calls = None, 0
             with resp:
-                for line in resp:
-                    line = line.strip()
-                    if not line.startswith(b"data:"):
-                        continue
-                    g = json.loads(line[5:].strip() or b"{}")
-                    if isinstance(g.get("error"), dict):
-                        emit({"content": f"[error] {g['error'].get('message', '')}"})
-                        finish = "stop"
-                        break
-                    text, thought, fin, calls = from_gemini(g, reply_mode)
-                    if thought:
-                        emit({"reasoning_content": thought})
-                    if text:
-                        emit({"content": text})
-                    for c in calls:
-                        emit({"tool_calls": [dict(c, index=n_calls)]})
-                        n_calls += 1
-                    if (g.get("candidates") or [{}])[0].get("finishReason"):
-                        finish = fin
+                try:
+                    for line in resp:
+                        line = line.strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        g = json.loads(line[5:].strip() or b"{}")
+                        if isinstance(g.get("error"), dict):
+                            emit({"content": f"[error] {g['error'].get('message', '')}"})
+                            finish = "stop"
+                            break
+                        text, thought, fin, calls = from_gemini(g, reply_mode)
+                        if thought:
+                            emit({"reasoning_content": thought})
+                        if text:
+                            emit({"content": text})
+                        for c in calls:
+                            emit({"tool_calls": [dict(c, index=n_calls)]})
+                            n_calls += 1
+                        if (g.get("candidates") or [{}])[0].get("finishReason"):
+                            finish = fin
+                except TimeoutError:
+                    return fail(*silent())
+                except (OSError, ValueError):
+                    if gone.is_set():
+                        return
+                    raise
+            if gone.is_set():
+                return
             with lock:
                 done.set()
                 put(chunk({}, "tool_calls" if n_calls else (finish or "stop")))
