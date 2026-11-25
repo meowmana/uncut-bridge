@@ -21,6 +21,10 @@ class Fake(BaseHTTPRequestHandler):
         if "slow-503" in self.path:
             time.sleep(1.8)
             return self._s(503, {"error": {"message": "busy"}})
+        if "stream-err" in self.path:
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            self.wfile.write(b'data: {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}}\n\n')
+            return
         if "hang" in self.path:
             # headers, then silence; notice the bridge hanging up the way an async server would, by reading EOF
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
@@ -44,6 +48,13 @@ class Fake(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
             self.wfile.flush(); time.sleep(3.2)
             self.wfile.write(b'data: {"candidates": [{"content": {"parts": [{"text": "late"}]}, "finishReason": "STOP"}]}\n\n')
+            return
+        if "capped" in self.path:
+            cut = {"candidates": [{"content": {"parts": [{"text": "plan", "thought": True}]}, "finishReason": "MAX_TOKENS"}]}
+            if ":streamGenerateContent" not in self.path:
+                return self._s(200, cut)
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            self.wfile.write(f"data: {json.dumps(cut)}\n\n".encode()); self.wfile.flush()
             return
         names = [d["name"] for t in seen["req"].get("tools", []) for d in t["functionDeclarations"]]
         called = []
@@ -187,7 +198,10 @@ try:
     code, out = req("/chat/completions", {"model": "fast-503", "messages": msgs[:2], "stream": True})
     assert code == 503 and json.loads(out)["error"]["message"] == "busy", (code, out)
     code, out = req("/chat/completions", {"model": "slow-503", "messages": msgs[:2], "stream": True})
-    assert code == 200 and '"error": {"message": "busy", "type": "upstream_error", "code": 503}' in out, (code, out)
+    assert code == 200 and '"error": {"message": "[503] busy", "type": "upstream_error", "code": 503}' in out, (code, out)
+    # aistudio-api answers a stream with 200 and reports errors inside it; the status must survive into the text
+    code, out = req("/chat/completions", {"model": "stream-err", "messages": msgs[:2], "stream": True})
+    assert code == 200 and '"content": "[error 503] overloaded"' in out, (code, out)
     assert out.rstrip().endswith("data: [DONE]"), out
     # OAI_BRIDGE_KEEPALIVE=0: nothing is sent until Gemini speaks, so a late error still gets its status
     Q = "http://127.0.0.1:18766/v1"
@@ -216,6 +230,13 @@ try:
                                         "Access-Control-Request-Headers": "authorization,content-type"})
     with urllib.request.urlopen(r) as x:
         assert "authorization" in x.headers.get("Access-Control-Allow-Headers", "").lower()
+    # [防截断] cut at the output limit before reply() arrived: say so instead of a blank message
+    o = json.loads(req("/chat/completions", {"model": "capped[防截断]", "messages": msgs})[1])
+    assert o["choices"][0]["finish_reason"] == "length" and "输出上限" in o["choices"][0]["message"]["content"], o
+    code, out = req("/chat/completions", {"model": "capped[防截断]", "messages": msgs, "stream": True})
+    assert "输出上限" in out and '"finish_reason": "length"' in out, out
+    o = json.loads(req("/chat/completions", {"model": "capped", "messages": msgs})[1])
+    assert o["choices"][0]["message"]["content"] == "", o
     print("all ok")
 finally:
     br.terminate()

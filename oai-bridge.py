@@ -18,6 +18,8 @@ FINISH = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "content_filter",
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # "<model>[防截断]" asks Gemini to hand the reply over as a function-call argument instead of plain text
 TOOL_SUFFIX = "[防截断]"
+# reply() arrives whole or not at all: a reply cut at the output limit would otherwise show up as a blank message
+CUT_NOTE = "[防截断] 模型写到输出上限，正文没能交出来。请重新生成，或调低思考强度。"
 REPLY_TOOL = {"name": "reply", "description": "Deliver the complete reply to the user.",
               "parameters": {"type": "object", "required": ["text"],
                              "properties": {"text": {"type": "string", "description": "The full reply, nothing omitted."}}}}
@@ -324,6 +326,8 @@ class H(BaseHTTPRequestHandler):
         if code != 200:
             return self.err(code, g)
         text, thought, finish, calls = from_gemini(g, reply_mode)
+        if reply_mode and finish == "length" and not text and not calls:
+            text = CUT_NOTE
         msg = {"role": "assistant", "content": text or (None if calls else "")}
         if calls:
             msg["tool_calls"] = calls
@@ -370,7 +374,8 @@ class H(BaseHTTPRequestHandler):
                 if not last[0]:
                     return self.err(code, g)
                 e = g.get("error") if isinstance(g.get("error"), dict) else {"message": json.dumps(g, ensure_ascii=False)}
-                put(json.dumps({"error": {"message": e.get("message", ""), "type": "upstream_error", "code": code}},
+                # the 200 is already out, and clients show only the message
+                put(json.dumps({"error": {"message": f"[{code}] {e.get('message', '')}", "type": "upstream_error", "code": code}},
                                ensure_ascii=False))
                 put("[DONE]")
 
@@ -406,7 +411,7 @@ class H(BaseHTTPRequestHandler):
                 return fail(502, {"error": {"message": f"upstream {UPSTREAM} unreachable: {e}"}})
             if gone.is_set():
                 return resp.close()
-            finish, n_calls = None, 0
+            finish, n_calls, said = None, 0, False
             with resp:
                 try:
                     for line in resp:
@@ -415,13 +420,15 @@ class H(BaseHTTPRequestHandler):
                             continue
                         g = json.loads(line[5:].strip() or b"{}")
                         if isinstance(g.get("error"), dict):
-                            emit({"content": f"[error] {g['error'].get('message', '')}"})
+                            e = g["error"]
+                            emit({"content": f"[error {e.get('code', '')}".rstrip() + f"] {e.get('message', '')}"})
                             finish = "stop"
                             break
                         text, thought, fin, calls = from_gemini(g, reply_mode)
                         if thought:
                             emit({"reasoning_content": thought})
                         if text:
+                            said = True
                             emit({"content": text})
                         for c in calls:
                             emit({"tool_calls": [dict(c, index=n_calls)]})
@@ -436,6 +443,8 @@ class H(BaseHTTPRequestHandler):
                     raise
             if gone.is_set():
                 return
+            if reply_mode and finish == "length" and not said and not n_calls:
+                emit({"content": CUT_NOTE})
             with lock:
                 done.set()
                 put(chunk({}, "tool_calls" if n_calls else (finish or "stop")))
