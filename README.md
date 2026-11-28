@@ -101,10 +101,10 @@ python oai-bridge.py
 
 ## 卸载
 
-Termux：菜单按 0 退到 `~ $`，粘这一行，停掉、删掉自启、删掉文件：
+Termux：菜单按 0 退到 `~ $`，粘这一行，停掉、删掉自启、删掉关假流的开关、删掉文件：
 
 ```sh
-pkill -f oai-bridge.py; sed -i '/oai-bridge/d' ~/.bashrc; rm -f ~/oai-bridge.py ~/oai-bridge.log
+pkill -f oai-bridge.py; sed -i '/oai-bridge/d; /OAI_BRIDGE_KEEPALIVE/d' ~/.bashrc; rm -f ~/oai-bridge.py ~/oai-bridge.log
 ```
 
 没反应是正常的，冒出新的 `~ $` 就是删完了。
