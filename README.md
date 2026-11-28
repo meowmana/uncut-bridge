@@ -132,7 +132,6 @@ pkill -f oai-bridge.py; sed -i '/oai-bridge/d; /OAI_BRIDGE_KEEPALIVE/d' ~/.bashr
 | `OAI_BRIDGE_PORT` | `8765` |
 | `OAI_BRIDGE_HOST` | `127.0.0.1` |
 | `OAI_BRIDGE_KEEPALIVE` | `1`。设成 `0` 就不在等的时候递空块 |
-| `OAI_BRIDGE_EXTRA_MODELS` | `gemini-4-argon,gemini-4-neon,gemini-4-hydrogen,gemini-4-carbon`。aistudio-api 的列表里没有也照样列出来（各带一个 `[防截断]`），逗号隔开，设成空就不加 |
 
 不想要等的时候递空块（酒馆计时会回到僵着不动的老样子）：
 

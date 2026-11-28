@@ -84,7 +84,7 @@ class Fake(BaseHTTPRequestHandler):
 
 up = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
 threading.Thread(target=up.serve_forever, daemon=True).start()
-env = dict(os.environ, OAI_BRIDGE_UPSTREAM=f"http://127.0.0.1:{up.server_port}", OAI_BRIDGE_PORT="18765", OAI_BRIDGE_EXTRA_MODELS="",
+env = dict(os.environ, OAI_BRIDGE_UPSTREAM=f"http://127.0.0.1:{up.server_port}", OAI_BRIDGE_PORT="18765",
            http_proxy="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9", no_proxy="", NO_PROXY="")
 br = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "oai-bridge.py")],
                       env=env, stdout=subprocess.DEVNULL)
@@ -111,19 +111,6 @@ try:
     code, out = req("/models")
     assert code == 200 and [m["id"] for m in json.loads(out)["data"]] == ["gemini-x", "gemini-x[防截断]"], out
     assert req("/models", key="nope")[0] == 401
-    # names in OAI_BRIDGE_EXTRA_MODELS are listed even when upstream leaves them out, without doubling ones it has
-    extra = subprocess.Popen(br.args, env=dict(env, OAI_BRIDGE_PORT="18768", OAI_BRIDGE_EXTRA_MODELS="gemini-x, gemini-y"), stdout=subprocess.DEVNULL)
-    try:
-        for _ in range(50):
-            try:
-                urllib.request.urlopen("http://127.0.0.1:18768/health"); break
-            except OSError:
-                time.sleep(0.1)
-        code, out = req("/models", base="http://127.0.0.1:18768/v1")
-        ids = [m["id"] for m in json.loads(out)["data"]]
-        assert ids == ["gemini-x", "gemini-y", "gemini-x[防截断]", "gemini-y[防截断]"], ids
-    finally:
-        extra.kill()
     msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "a"},
             {"role": "user", "content": [{"type": "text", "text": "b"}]}, {"role": "assistant", "content": "c"}]
     code, out = req("/chat/completions", {"model": "gemini-x", "messages": msgs, "max_tokens": 9})

@@ -8,9 +8,6 @@ HOST = os.environ.get("OAI_BRIDGE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OAI_BRIDGE_PORT", "8765"))
 KEEPALIVE = os.environ.get("OAI_BRIDGE_KEEPALIVE", "1") != "0"
 TIMEOUT = float(os.environ.get("OAI_BRIDGE_TIMEOUT", "600"))
-# always listed even when aistudio-api's own list leaves them out; sending to them never needed the list
-EXTRA_MODELS = [m.strip() for m in os.environ.get(
-    "OAI_BRIDGE_EXTRA_MODELS", "gemini-4-argon,gemini-4-neon,gemini-4-hydrogen,gemini-4-carbon").split(",") if m.strip()]
 SAFETY = [{"category": c, "threshold": "BLOCK_NONE"} for c in (
     "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
     "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")]
@@ -305,7 +302,6 @@ class H(BaseHTTPRequestHandler):
                 return self.err(code, g)
             ids = [m.get("name", "").removeprefix("models/") for m in g.get("models", [])]
             ids = [i for i in ids if i]
-            ids += [m for m in EXTRA_MODELS if m not in ids]
             return self.send(200, {"object": "list", "data": [
                 {"id": i, "object": "model", "created": 0, "owned_by": "google"}
                 for i in ids + [i + TOOL_SUFFIX for i in ids]]})
